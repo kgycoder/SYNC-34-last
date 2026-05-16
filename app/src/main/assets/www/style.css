@@ -4166,3 +4166,31 @@ button, a, div, span, input {
     #np-ls-left, #np-ls-right {
         flex-shrink: 0 !important;
     }
+
+/* ════════════════════════════════
+   LOCAL SAVE BUTTON
+════════════════════════════════ */
+.np-save-btn {
+    color: rgba(255,255,255,0.45);
+    transition: color .15s, transform .15s;
+    padding: 4px;
+    background: none;
+    border: none;
+    cursor: pointer;
+}
+.np-save-btn:hover { color: #fff; transform: scale(1.18); }
+.np-save-btn.on svg path,
+.np-save-btn.on svg polyline {
+    stroke: #4ade80;
+    fill: rgba(74,222,128,0.15);
+}
+
+.bar-save-btn {
+    color: var(--t3);
+    transition: all .15s;
+    display: flex;
+    align-items: center;
+}
+.bar-save-btn:hover { color: var(--t1); transform: scale(1.12); }
+.bar-save-btn.on svg path,
+.bar-save-btn.on svg polyline { stroke: #4ade80; }
