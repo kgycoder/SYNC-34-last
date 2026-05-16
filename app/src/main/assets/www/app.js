@@ -740,6 +740,187 @@ function post(type, extra = {}) {
 }
 
 /* ════════════════════════════════════════════
+   LOCAL MUSIC STORAGE — IndexedDB
+   반드시 PL/S 객체보다 먼저 정의되어야 함
+════════════════════════════════════════════ */
+const LM = {
+    db: null,
+    DB_NAME: 'sync_local_v1',
+    DB_VER: 1,
+    STORE: 'tracks',
+    PL_NAME: 'Local Music 💾',
+    PL_ID: '__local_music__'
+};
+
+function lmInit() {
+    return new Promise((ok, ng) => {
+        if (LM.db) { ok(LM.db); return; }
+        const req = indexedDB.open(LM.DB_NAME, LM.DB_VER);
+        req.onupgradeneeded = e => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(LM.STORE)) {
+                db.createObjectStore(LM.STORE, { keyPath: 'id' });
+            }
+        };
+        req.onsuccess = e => { LM.db = e.target.result; ok(LM.db); };
+        req.onerror = () => ng(req.error);
+    });
+}
+
+function lmSave(track) {
+    return new Promise((ok, ng) => {
+        const doSave = (thumb64) => {
+            lmInit().then(db => {
+                const entry = {
+                    id: track.id,
+                    title: track.title,
+                    channel: track.channel || '',
+                    dur: track.dur || 0,
+                    thumb: track.thumb || '',
+                    thumb64: thumb64,
+                    lyrics: (LY.videoId === track.id && LY.lines.length > 0)
+                        ? JSON.stringify(LY.lines) : null,
+                    savedAt: Date.now()
+                };
+                const tx = db.transaction(LM.STORE, 'readwrite');
+                tx.objectStore(LM.STORE).put(entry);
+                tx.oncomplete = () => ok(entry);
+                tx.onerror = () => ng(tx.error);
+            }).catch(ng);
+        };
+
+        // 썸네일 캡처 시도
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        const tryImg = (src) => {
+            img.onload = () => {
+                try {
+                    const cv = document.createElement('canvas');
+                    cv.width = 320; cv.height = 180;
+                    cv.getContext('2d').drawImage(img, 0, 0, 320, 180);
+                    doSave(cv.toDataURL('image/jpeg', 0.82));
+                } catch (_) { doSave(null); }
+            };
+            img.onerror = () => {
+                if (src === getThumbHq(track.id)) {
+                    img.src = getThumbMd(track.id);
+                } else {
+                    doSave(null);
+                }
+            };
+            img.src = src;
+        };
+        tryImg(getThumbHq(track.id));
+    });
+}
+
+function lmLoad() {
+    return lmInit().then(db => new Promise((ok, ng) => {
+        const tx = db.transaction(LM.STORE, 'readonly');
+        const req = tx.objectStore(LM.STORE).getAll();
+        req.onsuccess = () => ok(req.result || []);
+        req.onerror = () => ng(req.error);
+    }));
+}
+
+function lmDelete(id) {
+    return lmInit().then(db => new Promise((ok, ng) => {
+        const tx = db.transaction(LM.STORE, 'readwrite');
+        tx.objectStore(LM.STORE).delete(id);
+        tx.oncomplete = ok;
+        tx.onerror = () => ng(tx.error);
+    }));
+}
+
+function lmExists(id) {
+    return lmInit().then(db => new Promise(ok => {
+        const tx = db.transaction(LM.STORE, 'readonly');
+        const req = tx.objectStore(LM.STORE).get(id);
+        req.onsuccess = () => ok(!!req.result);
+        req.onerror = () => ok(false);
+    })).catch(() => Promise.resolve(false));
+}
+
+function lmGet(id) {
+    return lmInit().then(db => new Promise(ok => {
+        const tx = db.transaction(LM.STORE, 'readonly');
+        const req = tx.objectStore(LM.STORE).get(id);
+        req.onsuccess = () => ok(req.result || null);
+        req.onerror = () => ok(null);
+    })).catch(() => Promise.resolve(null));
+}
+
+/* Local Music 플레이리스트를 PL.lists에 동기화 */
+async function lmSyncPlaylist() {
+    try {
+        const tracks = await lmLoad();
+        // PL.lists에서 Local Music 찾기
+        let pl = PL.lists.find(p => p.id === LM.PL_ID);
+        if (!pl) {
+            pl = { id: LM.PL_ID, name: LM.PL_NAME, tracks: [] };
+            // 맨 앞에 삽입
+            PL.lists.unshift(pl);
+        }
+        pl.name = LM.PL_NAME;
+        pl.tracks = tracks
+            .sort((a, b) => b.savedAt - a.savedAt)
+            .map(t => ({
+                id: t.id,
+                title: t.title,
+                channel: t.channel,
+                dur: t.dur,
+                thumb: t.thumb64 || t.thumb
+            }));
+        // localStorage에는 Local Music 제외하고 저장 (plSave가 처리)
+        plSaveWithoutLocal();
+        if (PL.curId === LM.PL_ID) plRenderDetail(LM.PL_ID);
+        plRenderGrid();
+    } catch (e) {
+        console.error('lmSyncPlaylist error', e);
+    }
+}
+
+/* Local Music 저장 버튼 */
+async function saveTrackLocally(track) {
+    if (!track) { toast('⚠️ 저장할 곡이 없어요'); return; }
+
+    const already = await lmExists(track.id);
+    if (already) {
+        // Android WebView에서 confirm()이 막힐 수 있으므로 toast로 안내 후 즉시 삭제
+        await lmDelete(track.id);
+        await lmSyncPlaylist();
+        _updSaveBtn(track.id, false);
+        toast('🗑 로컬 저장 삭제됨');
+        return;
+    }
+
+    toast('💾 저장 중...');
+    try {
+        await lmSave(track);
+        await lmSyncPlaylist();
+        _updSaveBtn(track.id, true);
+        toast('✦ 저장 완료 — 플레이리스트 탭의 Local Music 확인');
+    } catch (e) {
+        toast('⚠️ 저장 실패');
+        console.error('saveTrackLocally', e);
+    }
+}
+
+/* 저장 버튼 UI 상태 갱신 */
+function _updSaveBtn(id, saved) {
+    document.querySelectorAll('.np-save-btn, .bar-save-btn').forEach(btn => {
+        btn.classList.toggle('saved', saved);
+        btn.title = saved ? '저장됨 (탭하면 삭제)' : '로컬 저장';
+    });
+}
+
+async function refreshSaveBtn(id) {
+    if (!id) { _updSaveBtn(null, false); return; }
+    const saved = await lmExists(id);
+    _updSaveBtn(id, saved);
+}
+
+/* ════════════════════════════════════════════
    STATE
 ════════════════════════════════════════════ */
 const S = {
@@ -1001,7 +1182,6 @@ function playTrack(t, idx = -1) {
     }
     _clearLyrics();
     fetchLyrics(t.id);
-    updSaveBtn(t.id);
 
     // 랜드스케이프 모드 활성 시 가사/아트 동기화
     if (NP_LS.active) {
@@ -1012,7 +1192,9 @@ function playTrack(t, idx = -1) {
         if (lsTitle) lsTitle.textContent = t.title;
         if (lsCh)    lsCh.textContent    = t.channel || 'YouTube';
     }
-       updSaveBtn(t.id);
+
+    // 저장 버튼 상태 갱신
+    refreshSaveBtn(t.id);
 }
 
 function togglePlay() {
@@ -1153,14 +1335,13 @@ function openNP() {
     if (LY.lines.length > 0) _startLyricsTick();
 }
 function closeNP() {
-    // 랜드스케이프 모드면 먼저 해제
     if (NP_LS.active) _exitNpLandscape();
     document.getElementById('np').classList.remove('on');
     _stopLyricsTick();
 }
 
 /* ════════════════════════════════════════════
-   NP LANDSCAPE FULLSCREEN (Android 전용)
+   NP LANDSCAPE FULLSCREEN
 ════════════════════════════════════════════ */
 const NP_LS = {
     active: false,
@@ -1181,14 +1362,12 @@ function _enterNpLandscape() {
     const np = document.getElementById('np');
     if (!np) return;
 
-    // DOM 먼저 구성
     _buildLandscapeDOM();
     _renderLsLyrics();
     _startLsTick();
 
     document.getElementById('np-fs-btn')?.classList.add('on');
 
-    // 가로 전환
     setTimeout(() => {
         try {
             window.AndroidBridge.postMessage(JSON.stringify({
@@ -1223,42 +1402,27 @@ function _buildLandscapeDOM() {
     const np = document.getElementById('np');
     if (!np || document.getElementById('np-ls-left')) return;
 
-    // 기존 요소 숨기기
     const artArea = np.querySelector('.np-art-area');
     const panel   = np.querySelector('.np-panel');
     if (artArea) artArea.style.display = 'none';
     if (panel)   panel.style.display   = 'none';
 
-    // np 자체를 flex row로
     np.style.flexDirection = 'row';
     np.style.overflow = 'hidden';
 
-    // ── 왼쪽 컬럼 ──
     const left = document.createElement('div');
     left.id = 'np-ls-left';
     left.style.cssText = [
-        'display:flex',
-        'flex-direction:column',
-        'align-items:center',
-        'justify-content:center',
-        'width:40%',
-        'height:100%',
-        'padding:20px 14px 20px 24px',
-        'box-sizing:border-box',
-        'position:relative',
-        'z-index:10',
-        'flex-shrink:0'
+        'display:flex','flex-direction:column','align-items:center',
+        'justify-content:center','width:40%','height:100%',
+        'padding:20px 14px 20px 24px','box-sizing:border-box',
+        'position:relative','z-index:10','flex-shrink:0'
     ].join(';');
 
-    // 앨범 아트
     const artShell = document.createElement('div');
     artShell.style.cssText = [
-        'width:min(190px,24vw)',
-        'aspect-ratio:1',
-        'border-radius:14px',
-        'overflow:hidden',
-        'flex-shrink:0',
-        'box-shadow:0 24px 80px rgba(0,0,0,0.85)',
+        'width:min(190px,24vw)','aspect-ratio:1','border-radius:14px',
+        'overflow:hidden','flex-shrink:0','box-shadow:0 24px 80px rgba(0,0,0,0.85)',
         'position:relative'
     ].join(';');
     const artImg = document.createElement('img');
@@ -1269,20 +1433,14 @@ function _buildLandscapeDOM() {
     artShell.appendChild(artImg);
     left.appendChild(artShell);
 
-    // 곡명 + 아티스트
     const meta = document.createElement('div');
     meta.style.cssText = 'width:100%;margin-top:10px;padding:0 4px;';
     const titleEl = document.createElement('div');
     titleEl.id = 'np-ls-title';
     titleEl.style.cssText = [
-        'font-size:11px',
-        'font-weight:700',
-        'color:rgba(255,255,255,0.96)',
-        'white-space:nowrap',
-        'overflow:hidden',
-        'text-overflow:ellipsis',
-        'letter-spacing:-0.3px',
-        'margin-bottom:3px'
+        'font-size:11px','font-weight:700','color:rgba(255,255,255,0.96)',
+        'white-space:nowrap','overflow:hidden','text-overflow:ellipsis',
+        'letter-spacing:-0.3px','margin-bottom:3px'
     ].join(';');
     titleEl.textContent = S.track?.title || '—';
     const chEl = document.createElement('div');
@@ -1293,7 +1451,6 @@ function _buildLandscapeDOM() {
     meta.appendChild(chEl);
     left.appendChild(meta);
 
-    // 재생바
     const prog = document.createElement('div');
     prog.style.cssText = 'width:100%;margin-top:8px;padding:0 4px;';
     prog.innerHTML = `
@@ -1307,7 +1464,6 @@ function _buildLandscapeDOM() {
     `;
     left.appendChild(prog);
 
-    // seek 터치 이벤트
     setTimeout(() => {
         const pb = document.getElementById('np-ls-pb');
         if (!pb) return;
@@ -1320,20 +1476,12 @@ function _buildLandscapeDOM() {
         pb.addEventListener('touchstart', e => { e.preventDefault(); doSeek(e.touches[0].clientX); }, { passive: false });
     }, 100);
 
-    // ── 오른쪽 컬럼: 가사 ──
     const right = document.createElement('div');
     right.id = 'np-ls-right';
-right.style.cssText = [
-        'display:flex',
-        'flex-direction:column',
-        'justify-content:center',
-        'width:60%',
-        'height:100%',
-        'padding:20px 28px 20px 12px',
-        'box-sizing:border-box',
-        'overflow:hidden',
-        'position:relative',
-        'z-index:10',
+    right.style.cssText = [
+        'display:flex','flex-direction:column','justify-content:center',
+        'width:60%','height:100%','padding:20px 28px 20px 12px',
+        'box-sizing:border-box','overflow:hidden','position:relative','z-index:10',
         '-webkit-mask-image:linear-gradient(to bottom, transparent 0%, black 12%, black 88%, transparent 100%)',
         'mask-image:linear-gradient(to bottom, transparent 0%, black 12%, black 88%, transparent 100%)'
     ].join(';');
@@ -1341,13 +1489,9 @@ right.style.cssText = [
     const scroll = document.createElement('div');
     scroll.id = 'np-ls-scroll';
     scroll.style.cssText = [
-        'overflow-y:auto',
-        'overflow-x:hidden',
-        'height:100%',
-        'padding:30px 8px',
-        'box-sizing:border-box',
-        'scrollbar-width:none',
-        '-ms-overflow-style:none'
+        'overflow-y:auto','overflow-x:hidden','height:100%',
+        'padding:30px 8px','box-sizing:border-box',
+        'scrollbar-width:none','-ms-overflow-style:none'
     ].join(';');
     right.appendChild(scroll);
 
@@ -1382,17 +1526,11 @@ function _renderLsLyrics() {
     LY.lines.forEach((line, i) => {
         const el = document.createElement('div');
         el.style.cssText = [
-            'font-size:clamp(16px,2.2vw,24px)',
-            'font-weight:700',
-            'line-height:1.55',
-            'color:rgba(255,255,255,0.00)',
-            'padding:6px 0',
-            'cursor:pointer',
-            'word-break:keep-all',
-            'overflow-wrap:break-word',
+            'font-size:clamp(16px,2.2vw,24px)','font-weight:700','line-height:1.55',
+            'color:rgba(255,255,255,0.00)','padding:6px 0','cursor:pointer',
+            'word-break:keep-all','overflow-wrap:break-word',
             'transition:color 0.35s ease, filter 0.35s ease',
-            'will-change:color,filter',
-            '-webkit-font-smoothing:antialiased'
+            'will-change:color,filter','-webkit-font-smoothing:antialiased'
         ].join(';');
         el.textContent = line.text;
         el.addEventListener('click', () => {
@@ -1423,7 +1561,6 @@ function _syncLsLyrics() {
         const dur = S.ytPlayer.getDuration() || 0;
         const pct = dur ? (cur / dur) * 100 : 0;
 
-        // 재생바 업데이트
         const pf = document.getElementById('np-ls-pf');
         if (pf) pf.style.width = pct.toFixed(2) + '%';
         const curEl = document.getElementById('np-ls-cur');
@@ -1431,14 +1568,12 @@ function _syncLsLyrics() {
         if (curEl) curEl.textContent = fmt(cur);
         if (totEl) totEl.textContent = fmt(dur);
 
-        // 아트 / 곡명 동기화
         const origArt = document.getElementById('np-art');
         const lsArt   = document.getElementById('np-ls-art');
         if (origArt && lsArt && origArt.src !== lsArt.src) lsArt.src = origArt.src;
 
         if (!LY.lines.length) return;
 
-        // 가사 싱크
         let found = -1;
         for (let i = LY.lines.length - 1; i >= 0; i--) {
             if (cur >= LY.lines[i].start) {
@@ -1479,7 +1614,6 @@ function _highlightLsLine(idx) {
             el.style.fontWeight = '700';
             el.style.filter     = 'none';
         } else {
-            /* 범위 밖 줄: 완전 투명 → 5줄 밖은 안 보임 */
             el.style.color      = 'rgba(255,255,255,0.00)';
             el.style.fontWeight = '700';
             el.style.filter     = 'none';
@@ -1528,6 +1662,7 @@ function refreshDots() {
 }
 function renderFavSide() {
     const el = document.getElementById('fav-side');
+    if (!el) return;
     if (!S.favs.length) { el.innerHTML = '<div class="fi-empty">즐겨찾기 없음</div>'; return; }
     el.innerHTML = S.favs.map((f, i) => `
     <div class="fi" onclick="playFav(${i})">
@@ -1592,15 +1727,22 @@ function gv(v, el) {
    PLAYLIST SYSTEM
 ════════════════════════════════════════════ */
 const PL = {
-    lists: JSON.parse(localStorage.getItem('xw_pl') || '[]').filter(p => p.id !== 'local_music_pl'),
+    // Local Music(__local_music__)은 localStorage에 저장하지 않음
+    lists: JSON.parse(localStorage.getItem('xw_pl') || '[]'),
     curId: null
 };
 
+// localStorage 저장 시 Local Music 제외
 function plSave() {
-    // Local Music(IndexedDB 관리)은 localStorage에서 제외
     const toSave = PL.lists.filter(p => p.id !== LM.PL_ID);
     localStorage.setItem('xw_pl', JSON.stringify(toSave));
 }
+
+// Local Music 제외 저장 (lmSyncPlaylist에서 호출)
+function plSaveWithoutLocal() {
+    plSave();
+}
+
 function plById(id) { return PL.lists.find(p => p.id === id); }
 
 let _dlgResolve = null;
@@ -1653,6 +1795,7 @@ async function plNewPrompt(defaultName = '') {
 
 async function plRenamePrompt() {
     const pl = plById(PL.curId); if (!pl) return;
+    if (pl.id === LM.PL_ID) { toast('Local Music은 이름을 바꿀 수 없어요'); return; }
     const name = await plDialog('이름 변경', pl.name);
     if (!name || name === pl.name) return;
     pl.name = name; plSave();
@@ -1662,6 +1805,7 @@ async function plRenamePrompt() {
 
 async function plDeleteCurrent() {
     const pl = plById(PL.curId); if (!pl) return;
+    if (pl.id === LM.PL_ID) { toast('Local Music은 삭제할 수 없어요'); return; }
     const ok = await plConfirm('플레이리스트 삭제', `"${pl.name}" 플레이리스트를 삭제할까요?`);
     if (!ok) return;
     PL.lists = PL.lists.filter(p => p.id !== PL.curId);
@@ -1669,6 +1813,7 @@ async function plDeleteCurrent() {
 }
 
 function plAddTrack(plId, track) {
+    if (plId === LM.PL_ID) { toast('Local Music에는 저장 버튼으로 추가하세요'); return false; }
     const pl = plById(plId); if (!pl) return false;
     if (pl.tracks.some(t => t.id === track.id)) { toast('이미 추가된 곡이에요'); return false; }
     pl.tracks.push({ id: track.id, title: track.title, channel: track.channel, dur: track.dur, thumb: track.thumb });
@@ -1679,6 +1824,14 @@ function plAddTrack(plId, track) {
 }
 
 function plRemoveTrack(plId, trackId) {
+    if (plId === LM.PL_ID) {
+        // Local Music에서 제거 = IndexedDB에서 삭제
+        lmDelete(trackId).then(() => {
+            lmSyncPlaylist();
+            if (S.track?.id === trackId) refreshSaveBtn(trackId);
+        });
+        return;
+    }
     const pl = plById(plId); if (!pl) return;
     pl.tracks = pl.tracks.filter(t => t.id !== trackId);
     plSave(); plRenderDetail(plId);
@@ -1706,8 +1859,8 @@ function plRenderGrid() {
     g.innerHTML = '';
     PL.lists.forEach(pl => {
         const card = document.createElement('div');
-        card.className = 'pl-card';
-        const thumbs = pl.tracks.slice(0, 4).map(t => getThumbMd(t.id));
+        card.className = 'pl-card' + (pl.id === LM.PL_ID ? ' pl-card-local' : '');
+        const thumbs = pl.tracks.slice(0, 4).map(t => t.thumb || getThumbMd(t.id));
         const coverHtml = thumbs.length === 0
             ? `<div class="pl-cover-empty"><svg width="40" height="40" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="13" height="13" rx="2"/><rect x="23" y="4" width="13" height="13" rx="2"/><rect x="4" y="23" width="13" height="13" rx="2"/><line x1="29.5" y1="23" x2="29.5" y2="36"/><line x1="23" y1="29.5" x2="36" y2="29.5"/></svg></div>`
             : `<div class="pl-cover${thumbs.length === 1 ? ' single' : ''}">${thumbs.map(src => `<img src="${esc(src)}" onerror="this.src=''" alt="">`).join('')}</div>`;
@@ -1728,8 +1881,18 @@ function plRenderDetail(plId) {
     document.getElementById('pl-detail-view').style.display = '';
     document.getElementById('pl-detail-name').textContent = pl.name;
     document.getElementById('pl-detail-count').textContent = `${pl.tracks.length}곡`;
+
+    // Local Music이면 편집 버튼 숨기기
+    const isLocal = plId === LM.PL_ID;
+    const renameBtn = document.getElementById('pl-rename-btn');
+    const deleteBtn = document.getElementById('pl-delete-btn');
+    const addBtn = document.getElementById('pl-add-track-wrap');
+    if (renameBtn) renameBtn.style.display = isLocal ? 'none' : '';
+    if (deleteBtn) deleteBtn.style.display = isLocal ? 'none' : '';
+    if (addBtn)    addBtn.style.display    = isLocal ? 'none' : '';
+
     const cover = document.getElementById('pl-detail-cover');
-    const thumbs = pl.tracks.slice(0, 4).map(t => getThumbMd(t.id));
+    const thumbs = pl.tracks.slice(0, 4).map(t => t.thumb || getThumbMd(t.id));
     cover.className = 'pl-detail-cover' + (thumbs.length === 1 ? ' single' : '');
     cover.innerHTML = thumbs.length
         ? thumbs.map(src => `<img src="${esc(src)}" alt="">`).join('')
@@ -1739,7 +1902,7 @@ function plRenderDetail(plId) {
         list.innerHTML = `<div class="state">
       <svg width="36" height="36" viewBox="0 0 36 36" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M3 9h30M3 18h20M3 27h24"/></svg>
       <h3 style="font-size:14px">곡이 없어요</h3>
-      <p>상단의 곡 추가 버튼을 눌러보세요</p>
+      <p>${isLocal ? '재생 화면의 💾 버튼으로 저장하세요' : '상단의 곡 추가 버튼을 눌러보세요'}</p>
     </div>`;
         return;
     }
@@ -1749,7 +1912,7 @@ function plRenderDetail(plId) {
         row.className = 'pl-track' + (S.track?.id === t.id ? ' playing' : '');
         row.innerHTML = `
       <span class="pl-track-num">${i + 1}</span>
-      <img class="pl-track-art" src="${esc(getThumbMd(t.id))}" onerror="this.src='${esc(t.thumb)}'" alt="">
+      <img class="pl-track-art" src="${esc(t.thumb || getThumbMd(t.id))}" onerror="this.src='${esc(getThumbMd(t.id))}'" alt="">
       <div class="pl-track-m">
         <div class="pl-track-t">${esc(t.title)}</div>
         <div class="pl-track-c">${esc(t.channel)}</div>
@@ -1850,8 +2013,10 @@ function plShowCtx(e, track) {
     _plCtxTrack = track;
     const menu = document.getElementById('pl-ctx-menu');
     const list = document.getElementById('pl-ctx-list');
-    list.innerHTML = PL.lists.length
-        ? PL.lists.map(pl => `
+    // Local Music 제외하고 목록 표시
+    const userPls = PL.lists.filter(p => p.id !== LM.PL_ID);
+    list.innerHTML = userPls.length
+        ? userPls.map(pl => `
         <button class="pl-ctx-item" onclick="plCtxAdd('${esc(pl.id)}')">
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <rect x="1" y="1" width="4" height="4" rx="0.8"/><rect x="7" y="1" width="4" height="4" rx="0.8"/>
@@ -1859,7 +2024,7 @@ function plShowCtx(e, track) {
           </svg>${esc(pl.name)}
         </button>`).join('')
         : '';
-    const mw = 210, mh = 80 + PL.lists.length * 36;
+    const mw = 210, mh = 80 + userPls.length * 36;
     let x = e.clientX, y = e.clientY;
     if (x + mw > innerWidth) x = innerWidth - mw - 8;
     if (y + mh > innerHeight) y = innerHeight - mh - 8;
@@ -2043,7 +2208,6 @@ async function fetchLyrics(videoId) {
             LY.videoId = videoId;
             LY.lines = res.lines;
             _renderLyrics();
-            // 랜드스케이프 모드 활성 시 가사 재렌더
             if (NP_LS.active) {
                 NP_LS.curIdx = -1;
                 _renderLsLyrics();
@@ -2121,7 +2285,6 @@ function _clearLyrics() {
     LY.curIdx = -1;
     LY.videoId = null;
     LY._fetching = null;
-    // 랜드스케이프 가사도 초기화
     if (NP_LS.active) {
         NP_LS.curIdx = -1;
         const scroll = document.getElementById('np-ls-scroll');
@@ -2130,7 +2293,7 @@ function _clearLyrics() {
 }
 
 /* ════════════════════════════════════════════
-   FULLSCREEN STATE (PC 전용, Android에서는 미사용)
+   FULLSCREEN STATE
 ════════════════════════════════════════════ */
 let _fsResizeObserver = null;
 
@@ -2508,13 +2671,13 @@ updateBarVisibility();
 renderFavSide();
 setTimeout(() => { loadRec('pop music 2024 official', 'rec-row'); loadRec('kpop 2024 mv official', 'hot-row'); }, 700);
 setTimeout(() => toast('✦ SYNC에 오신 걸 환영해요'), 1000);
-setTimeout(() => lmSyncPlaylist(), 1500);
+// Local Music 플레이리스트 초기화 (IndexedDB에서 복원)
+setTimeout(() => lmSyncPlaylist(), 1200);
 
 /* ════════════════════════════════════════════
    ANDROID INTEGRATION
 ════════════════════════════════════════════ */
 window.__onAndroidBack = function() {
-    // 랜드스케이프 전체화면 모드면 먼저 해제
     if (NP_LS.active) { _exitNpLandscape(); return; }
     const np = document.getElementById('np');
     if (np && np.classList.contains('on')) { closeNP(); return; }
@@ -2523,15 +2686,12 @@ window.__onAndroidBack = function() {
     if (document.getElementById('pl-add-modal-overlay')?.classList.contains('on')) { plAddModalClose(); return; }
 };
 
-// 화면 회전 감지 — NP_LS가 active 중이면 무시
 function _onOrientationChange() {
     if (NP_LS.active) return;
-    // PC fullscreen 처리만 (Android는 NP_LS로 별도 처리)
 }
 window.addEventListener('resize', _onOrientationChange);
 window.addEventListener('orientationchange', () => setTimeout(_onOrientationChange, 150));
 
-// 미니 바 터치 seek
 const _barEl = document.getElementById('bar');
 if (_barEl) {
     _barEl.addEventListener('touchstart', e => {
@@ -2549,167 +2709,3 @@ document.addEventListener('touchend', e => {
     const btn = e.target.closest('.c-play-btn');
     if (btn) { e.preventDefault(); btn.click(); }
 }, { passive: false });
-
-/* ════════════════════════════════════════════
-   LOCAL MUSIC STORAGE SYSTEM
-   - IndexedDB에 트랙 메타데이터 + 썸네일(base64) + 가사 저장
-   - "Local Music" 플레이리스트 자동 생성/관리
-════════════════════════════════════════════ */
-const LM = {
-    db: null,
-    DB_NAME: 'sync_local',
-    DB_VER: 1,
-    STORE: 'tracks',
-    PL_NAME: 'Local Music',
-    PL_ID: 'local_music_pl'
-};
-
-function lmInit() {
-    return new Promise((ok, ng) => {
-        if (LM.db) { ok(LM.db); return; }
-        const req = indexedDB.open(LM.DB_NAME, LM.DB_VER);
-        req.onupgradeneeded = e => {
-            const db = e.target.result;
-            if (!db.objectStoreNames.contains(LM.STORE)) {
-                db.createObjectStore(LM.STORE, { keyPath: 'id' });
-            }
-        };
-        req.onsuccess = e => { LM.db = e.target.result; ok(LM.db); };
-        req.onerror   = () => ng(req.error);
-    });
-}
-
-async function lmSave(track) {
-    const db = await lmInit();
-    return new Promise((ok, ng) => {
-        // 썸네일을 base64로 변환
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.onload = () => {
-            try {
-                const cv = document.createElement('canvas');
-                cv.width = 320; cv.height = 180;
-                cv.getContext('2d').drawImage(img, 0, 0, 320, 180);
-                const thumb64 = cv.toDataURL('image/jpeg', 0.85);
-
-                const entry = {
-                    id:       track.id,
-                    title:    track.title,
-                    channel:  track.channel,
-                    dur:      track.dur || 0,
-                    thumb:    track.thumb,
-                    thumb64:  thumb64,
-                    lyrics:   LY.videoId === track.id ? JSON.stringify(LY.lines) : null,
-                    savedAt:  Date.now()
-                };
-                const tx = db.transaction(LM.STORE, 'readwrite');
-                tx.objectStore(LM.STORE).put(entry);
-                tx.oncomplete = () => ok(entry);
-                tx.onerror    = () => ng(tx.error);
-            } catch(e) { ng(e); }
-        };
-        img.onerror = () => {
-            // 썸네일 실패해도 저장 진행
-            const entry = {
-                id: track.id, title: track.title,
-                channel: track.channel, dur: track.dur || 0,
-                thumb: track.thumb, thumb64: null,
-                lyrics: LY.videoId === track.id ? JSON.stringify(LY.lines) : null,
-                savedAt: Date.now()
-            };
-            const tx = db.transaction(LM.STORE, 'readwrite');
-            tx.objectStore(LM.STORE).put(entry);
-            tx.oncomplete = () => ok(entry);
-            tx.onerror    = () => ng(tx.error);
-        };
-        img.src = getThumbHq(track.id);
-    });
-}
-
-async function lmLoad() {
-    const db = await lmInit();
-    return new Promise((ok, ng) => {
-        const tx  = db.transaction(LM.STORE, 'readonly');
-        const req = tx.objectStore(LM.STORE).getAll();
-        req.onsuccess = () => ok(req.result || []);
-        req.onerror   = () => ng(req.error);
-    });
-}
-
-async function lmDelete(id) {
-    const db = await lmInit();
-    return new Promise((ok, ng) => {
-        const tx = db.transaction(LM.STORE, 'readwrite');
-        tx.objectStore(LM.STORE).delete(id);
-        tx.oncomplete = ok;
-        tx.onerror    = () => ng(tx.error);
-    });
-}
-
-async function lmExists(id) {
-    const db = await lmInit();
-    return new Promise((ok) => {
-        const tx  = db.transaction(LM.STORE, 'readonly');
-        const req = tx.objectStore(LM.STORE).get(id);
-        req.onsuccess = () => ok(!!req.result);
-        req.onerror   = () => ok(false);
-    });
-}
-
-/* ── Local Music 플레이리스트 동기화 ── */
-async function lmSyncPlaylist() {
-    const tracks = await lmLoad();
-    let pl = PL.lists.find(p => p.id === LM.PL_ID);
-    if (!pl) {
-        pl = { id: LM.PL_ID, name: LM.PL_NAME, tracks: [] };
-        PL.lists.unshift(pl);
-    }
-    pl.tracks = tracks.map(t => ({
-        id: t.id, title: t.title,
-        channel: t.channel, dur: t.dur,
-        thumb: t.thumb64 || t.thumb
-    }));
-    plSave();
-    if (PL.curId === LM.PL_ID) plRenderDetail(LM.PL_ID);
-    plRenderGrid();
-}
-
-/* ── 저장 버튼 클릭 핸들러 ── */
-async function saveTrackLocally(track) {
-    if (!track) { toast('⚠️ 저장할 곡이 없어요'); return; }
-
-    const already = await lmExists(track.id);
-    if (already) {
-        const ok = confirm(`"${track.title.slice(0, 30)}"은 이미 저장되어 있어요.\n삭제하시겠어요?`);
-        if (!ok) return;
-        await lmDelete(track.id);
-        await lmSyncPlaylist();
-        updSaveBtn(track.id);
-        toast('🗑 저장 삭제됨');
-        return;
-    }
-
-    toast('💾 저장 중...');
-    try {
-        await lmSave(track);
-        await lmSyncPlaylist();
-        updSaveBtn(track.id);
-        toast('✦ 로컬에 저장됨 — Local Music 플레이리스트 확인');
-    } catch(e) {
-        toast('⚠️ 저장 실패: ' + (e.message || '오류'));
-    }
-}
-
-/* ── 저장 버튼 상태 업데이트 ── */
-async function updSaveBtn(id) {
-    const saved = id ? await lmExists(id) : false;
-    document.querySelectorAll('.np-save-btn, .bar-save-btn').forEach(btn => {
-        btn.classList.toggle('on', saved);
-        btn.title = saved ? '저장됨 (클릭하면 삭제)' : '로컬 저장';
-    });
-}
-
-/* playTrack 후크: 저장 버튼 상태 갱신 */
-const _origPlayTrack = playTrack;
-// playTrack은 함수 선언식이므로 직접 래핑 대신 playTrack 내부 끝에 호출 추가
-// → app.js의 playTrack 함수 내부 마지막에 updSaveBtn(t.id) 추가 (아래 참고)
