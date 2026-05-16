@@ -1001,6 +1001,7 @@ function playTrack(t, idx = -1) {
     }
     _clearLyrics();
     fetchLyrics(t.id);
+    updSaveBtn(t.id);
 
     // 랜드스케이프 모드 활성 시 가사/아트 동기화
     if (NP_LS.active) {
@@ -1591,11 +1592,15 @@ function gv(v, el) {
    PLAYLIST SYSTEM
 ════════════════════════════════════════════ */
 const PL = {
-    lists: JSON.parse(localStorage.getItem('xw_pl') || '[]'),
+    lists: JSON.parse(localStorage.getItem('xw_pl') || '[]').filter(p => p.id !== 'local_music_pl'),
     curId: null
 };
 
-function plSave() { localStorage.setItem('xw_pl', JSON.stringify(PL.lists)); }
+function plSave() {
+    // Local Music(IndexedDB 관리)은 localStorage에서 제외
+    const toSave = PL.lists.filter(p => p.id !== LM.PL_ID);
+    localStorage.setItem('xw_pl', JSON.stringify(toSave));
+}
 function plById(id) { return PL.lists.find(p => p.id === id); }
 
 let _dlgResolve = null;
@@ -2503,6 +2508,7 @@ updateBarVisibility();
 renderFavSide();
 setTimeout(() => { loadRec('pop music 2024 official', 'rec-row'); loadRec('kpop 2024 mv official', 'hot-row'); }, 700);
 setTimeout(() => toast('✦ SYNC에 오신 걸 환영해요'), 1000);
+setTimeout(() => lmSyncPlaylist(), 1500);
 
 /* ════════════════════════════════════════════
    ANDROID INTEGRATION
