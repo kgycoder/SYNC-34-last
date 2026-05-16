@@ -1011,6 +1011,7 @@ function playTrack(t, idx = -1) {
         if (lsTitle) lsTitle.textContent = t.title;
         if (lsCh)    lsCh.textContent    = t.channel || 'YouTube';
     }
+       updSaveBtn(t.id);
 }
 
 function togglePlay() {
@@ -2542,3 +2543,167 @@ document.addEventListener('touchend', e => {
     const btn = e.target.closest('.c-play-btn');
     if (btn) { e.preventDefault(); btn.click(); }
 }, { passive: false });
+
+/* ════════════════════════════════════════════
+   LOCAL MUSIC STORAGE SYSTEM
+   - IndexedDB에 트랙 메타데이터 + 썸네일(base64) + 가사 저장
+   - "Local Music" 플레이리스트 자동 생성/관리
+════════════════════════════════════════════ */
+const LM = {
+    db: null,
+    DB_NAME: 'sync_local',
+    DB_VER: 1,
+    STORE: 'tracks',
+    PL_NAME: 'Local Music',
+    PL_ID: 'local_music_pl'
+};
+
+function lmInit() {
+    return new Promise((ok, ng) => {
+        if (LM.db) { ok(LM.db); return; }
+        const req = indexedDB.open(LM.DB_NAME, LM.DB_VER);
+        req.onupgradeneeded = e => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(LM.STORE)) {
+                db.createObjectStore(LM.STORE, { keyPath: 'id' });
+            }
+        };
+        req.onsuccess = e => { LM.db = e.target.result; ok(LM.db); };
+        req.onerror   = () => ng(req.error);
+    });
+}
+
+async function lmSave(track) {
+    const db = await lmInit();
+    return new Promise((ok, ng) => {
+        // 썸네일을 base64로 변환
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => {
+            try {
+                const cv = document.createElement('canvas');
+                cv.width = 320; cv.height = 180;
+                cv.getContext('2d').drawImage(img, 0, 0, 320, 180);
+                const thumb64 = cv.toDataURL('image/jpeg', 0.85);
+
+                const entry = {
+                    id:       track.id,
+                    title:    track.title,
+                    channel:  track.channel,
+                    dur:      track.dur || 0,
+                    thumb:    track.thumb,
+                    thumb64:  thumb64,
+                    lyrics:   LY.videoId === track.id ? JSON.stringify(LY.lines) : null,
+                    savedAt:  Date.now()
+                };
+                const tx = db.transaction(LM.STORE, 'readwrite');
+                tx.objectStore(LM.STORE).put(entry);
+                tx.oncomplete = () => ok(entry);
+                tx.onerror    = () => ng(tx.error);
+            } catch(e) { ng(e); }
+        };
+        img.onerror = () => {
+            // 썸네일 실패해도 저장 진행
+            const entry = {
+                id: track.id, title: track.title,
+                channel: track.channel, dur: track.dur || 0,
+                thumb: track.thumb, thumb64: null,
+                lyrics: LY.videoId === track.id ? JSON.stringify(LY.lines) : null,
+                savedAt: Date.now()
+            };
+            const tx = db.transaction(LM.STORE, 'readwrite');
+            tx.objectStore(LM.STORE).put(entry);
+            tx.oncomplete = () => ok(entry);
+            tx.onerror    = () => ng(tx.error);
+        };
+        img.src = getThumbHq(track.id);
+    });
+}
+
+async function lmLoad() {
+    const db = await lmInit();
+    return new Promise((ok, ng) => {
+        const tx  = db.transaction(LM.STORE, 'readonly');
+        const req = tx.objectStore(LM.STORE).getAll();
+        req.onsuccess = () => ok(req.result || []);
+        req.onerror   = () => ng(req.error);
+    });
+}
+
+async function lmDelete(id) {
+    const db = await lmInit();
+    return new Promise((ok, ng) => {
+        const tx = db.transaction(LM.STORE, 'readwrite');
+        tx.objectStore(LM.STORE).delete(id);
+        tx.oncomplete = ok;
+        tx.onerror    = () => ng(tx.error);
+    });
+}
+
+async function lmExists(id) {
+    const db = await lmInit();
+    return new Promise((ok) => {
+        const tx  = db.transaction(LM.STORE, 'readonly');
+        const req = tx.objectStore(LM.STORE).get(id);
+        req.onsuccess = () => ok(!!req.result);
+        req.onerror   = () => ok(false);
+    });
+}
+
+/* ── Local Music 플레이리스트 동기화 ── */
+async function lmSyncPlaylist() {
+    const tracks = await lmLoad();
+    let pl = PL.lists.find(p => p.id === LM.PL_ID);
+    if (!pl) {
+        pl = { id: LM.PL_ID, name: LM.PL_NAME, tracks: [] };
+        PL.lists.unshift(pl);
+    }
+    pl.tracks = tracks.map(t => ({
+        id: t.id, title: t.title,
+        channel: t.channel, dur: t.dur,
+        thumb: t.thumb64 || t.thumb
+    }));
+    plSave();
+    if (PL.curId === LM.PL_ID) plRenderDetail(LM.PL_ID);
+    plRenderGrid();
+}
+
+/* ── 저장 버튼 클릭 핸들러 ── */
+async function saveTrackLocally(track) {
+    if (!track) { toast('⚠️ 저장할 곡이 없어요'); return; }
+
+    const already = await lmExists(track.id);
+    if (already) {
+        const ok = confirm(`"${track.title.slice(0, 30)}"은 이미 저장되어 있어요.\n삭제하시겠어요?`);
+        if (!ok) return;
+        await lmDelete(track.id);
+        await lmSyncPlaylist();
+        updSaveBtn(track.id);
+        toast('🗑 저장 삭제됨');
+        return;
+    }
+
+    toast('💾 저장 중...');
+    try {
+        await lmSave(track);
+        await lmSyncPlaylist();
+        updSaveBtn(track.id);
+        toast('✦ 로컬에 저장됨 — Local Music 플레이리스트 확인');
+    } catch(e) {
+        toast('⚠️ 저장 실패: ' + (e.message || '오류'));
+    }
+}
+
+/* ── 저장 버튼 상태 업데이트 ── */
+async function updSaveBtn(id) {
+    const saved = id ? await lmExists(id) : false;
+    document.querySelectorAll('.np-save-btn, .bar-save-btn').forEach(btn => {
+        btn.classList.toggle('on', saved);
+        btn.title = saved ? '저장됨 (클릭하면 삭제)' : '로컬 저장';
+    });
+}
+
+/* playTrack 후크: 저장 버튼 상태 갱신 */
+const _origPlayTrack = playTrack;
+// playTrack은 함수 선언식이므로 직접 래핑 대신 playTrack 내부 끝에 호출 추가
+// → app.js의 playTrack 함수 내부 마지막에 updSaveBtn(t.id) 추가 (아래 참고)
